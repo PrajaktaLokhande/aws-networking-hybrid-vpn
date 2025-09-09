@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Hybrid Networking Lab - Site-to-Site VPN (VGW) + Client VPN. VPC with public/private subnets, NAT,
+  Bastion + Private App hosts. Static VPN to a Customer Gateway (strongSwan), and a Client VPN endpoint.
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 KeyPair name for SSH
+  YourIpCidr:
+    Type: String
+    Description: Your IP in CIDR form for SSH to bastion (e.g., 203.0.113.10/32)
+    Default: 0.0.0.0/0
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t2.micro, t3.micro, t3a.micro]
+  OnPremPublicIp:
+    Type: String
+    Description: Public IP address of your on‑prem strongSwan/Openswan VM (x.x.x.x/32)
+  OnPremSubnetCidr:
+    Type: String
+    Description: On‑prem subnet CIDR reachable over the VPN (e.g., 192.168.100.0/24)
+  ClientVpnCidr:
+    Type: String
+    Default: 172.16.0.0/22
+    Description: Client address pool for AWS Client VPN
+  ServerCertificateArn:
+    Type: String
+    Description: ACM ARN for the Client VPN **server** certificate (imported)
+  ClientRootCertArn:
+    Type: String
+    Description: ACM ARN for the **client root CA** (mutual auth)
+
+Resources:
+  AmiAL2023:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.40.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: lab4-vpc }]
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+  AttachIgw:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref Igw
+
+  SubnetPublic:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.40.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: lab4-public }]
+
+  SubnetPrivate:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.40.2.0/24
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: lab4-private }]
+
+  RtPublic:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC }
+  AssocPub:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetPublic, RouteTableId: !Ref RtPublic }
+  RtPubDefault:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RtPublic
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  EipNat:
+    Type: AWS::EC2::EIP
+    Properties: { Domain: vpc }
+  NatGw:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EipNat.AllocationId
+      SubnetId: !Ref SubnetPublic
+      ConnectivityType: public
+      Tags: [{ Key: Name, Value: lab4-nat }]
+
+  RtPrivate:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC }
+  AssocPri:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetPrivate, RouteTableId: !Ref RtPrivate }
+  RtPriDefault:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RtPrivate
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGw
+
+  SgBastion:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Bastion SG — SSH from YourIpCidr, HTTP egress
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref YourIpCidr }
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0 }
+
+  SgApp:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App SG — HTTP from VPC/Client VPN/On-Prem
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 10.40.0.0/16 }          # From VPC
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: !Ref ClientVpnCidr }    # From Client VPN
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: !Ref OnPremSubnetCidr } # From On-Prem via VPN
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0 }
+
+  Bastion:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiAL2023
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetPublic
+      SecurityGroupIds: [ !Ref SgBastion ]
+      Tags: [{ Key: Name, Value: lab4-bastion }]
+
+  AppEc2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiAL2023
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetPrivate
+      SecurityGroupIds: [ !Ref SgApp ]
+      Tags: [{ Key: Name, Value: lab4-app }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+          dnf -y install httpd
+          echo "<h1>Lab4 Private App (10.40.2.0/24)</h1>" > /var/www/html/index.html
+          systemctl enable --now httpd
+
+  # --------- Site-to-Site VPN (VGW + CGW + VPNConnection) ---------
+  Vgw:
+    Type: AWS::EC2::VPNGateway
+    Properties:
+      Type: ipsec.1
+      AmazonSideAsn: 64512
+      Tags: [{ Key: Name, Value: lab4-vgw }]
+
+  AttachVgw:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      VpnGatewayId: !Ref Vgw
+
+  Cgw:
+    Type: AWS::EC2::CustomerGateway
+    Properties:
+      BgpAsn: 65000
+      IpAddress: !Select [0, !Split ["/", !Ref OnPremPublicIp]]  # accept x.x.x.x/32, store IP part
+      Type: ipsec.1
+      Tags: [{ Key: Name, Value: lab4-cgw }]
+
+  VpnConn:
+    Type: AWS::EC2::VPNConnection
+    Properties:
+      Type: ipsec.1
+      CustomerGatewayId: !Ref Cgw
+      VpnGatewayId: !Ref Vgw
+      StaticRoutesOnly: true
+      Tags: [{ Key: Name, Value: lab4-vpn }]
+
+  VpnRouteToOnPrem:
+    Type: AWS::EC2::VPNConnectionRoute
+    Properties:
+      DestinationCidrBlock: !Ref OnPremSubnetCidr
+      VpnConnectionId: !Ref VpnConn
+
+  RtPriToOnPrem:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RtPrivate
+      DestinationCidrBlock: !Ref OnPremSubnetCidr
+      GatewayId: !Ref Vgw
+
+  # ----------------- Client VPN (SSL) -----------------
+  ClientVpn:
+    Type: AWS::EC2::ClientVpnEndpoint
+    Properties:
+      ClientCidrBlock: !Ref ClientVpnCidr
+      ServerCertificateArn: !Ref ServerCertificateArn
+      AuthenticationOptions:
+        - Type: certificate-authentication
+          MutualAuthentication:
+            ClientRootCertificateChainArn: !Ref ClientRootCertArn
+      ConnectionLogOptions:
+        Enabled: false
+      SplitTunnel: true
+      VpcId: !Ref VPC
+      SecurityGroupIds: [ !Ref SgApp ]
+      TransportProtocol: udp
+      Tags: [{ Key: Name, Value: lab4-clientvpn }]
+
+  ClientVpnAssoc:
+    Type: AWS::EC2::ClientVpnTargetNetworkAssociation
+    Properties:
+      ClientVpnEndpointId: !Ref ClientVpn
+      SubnetId: !Ref SubnetPublic
+
+  ClientVpnAuthRule:
+    Type: AWS::EC2::ClientVpnAuthorizationRule
+    Properties:
+      ClientVpnEndpointId: !Ref ClientVpn
+      AuthorizeAllGroups: true
+      TargetNetworkCidr: 10.40.0.0/16
+      Description: Allow clients to reach VPC
+
+Outputs:
+  BastionPublicIP:
+    Value: !GetAtt Bastion.PublicIp
+    Description: Public IP of bastion host
+  AppPrivateIP:
+    Value: !GetAtt AppEc2.PrivateIp
+    Description: Private App EC2 IP (target for VPN tests)
+  ClientVpnEndpointId:
+    Value: !Ref ClientVpn
+    Description: Client VPN endpoint ID
+  VpnConnectionId:
+    Value: !Ref VpnConn
+    Description: Site-to-Site VPN connection ID
